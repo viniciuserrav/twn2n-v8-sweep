@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+case1_v8_anchor_results/
+case1_results/
+case1_v7_anchor_results/
+*.xlsx
+.venv/
+.DS_Store
