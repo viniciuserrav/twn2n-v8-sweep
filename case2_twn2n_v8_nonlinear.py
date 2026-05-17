@@ -71,14 +71,22 @@ N_MODELS = (1, 2)  # n_models = 1 -> single pendulum, n_models = 2 -> double
 G = 9.81
 L_LINK = 1.0          # length of each rod
 M_BOB = 1.0           # mass of each bob
-C_TANG = 0.02         # tangential damping coefficient (kg m^2 / s on each angle)
+# Tangential damping calibrated so the free-vibration record decays to a few
+# percent of its initial energy at T_REC (matching case 1's ZETA_MIN target):
+#   2*zeta*omega = C_TANG / (m L^2)   for the linearised pendulum,
+#   energy at T_REC = exp(-C_TANG * T_REC / (m L^2)).
+# With T_REC = 2000 s and m = L = 1, C_TANG = 1e-3 gives exp(-2) ≈ 13 % for
+# the single pendulum and ~1-5 % for the double pendulum's slowest mode, in
+# the same order of magnitude as case 1's slowest random-mode decay.
+C_TANG = 0.001
 THETA0_MAX = 0.6      # max initial angle, rad — large enough to exercise sin nonlinearity
 
-# Force amplitude for cases (b) and (c).  Scaled so the pendulum response is
-# comparable to the case-1 amplitude scale (otherwise low-SNR cells become
-# all-noise).
-FORCE_AMP_B = 0.30
-FORCE_AMP_C = 0.30
+# Force amplitudes for cases (b) and (c).  Calibrated together with C_TANG
+# so the steady-state pendulum response stays at moderate angles
+# (|theta| <~ 0.5 rad), broadly matching the per-channel signal amplitudes
+# produced by the random linear systems of case 1.
+FORCE_AMP_B = 0.05
+FORCE_AMP_C = 0.05
 
 
 def n_sensors_grid_case2(n_models: int) -> list[int]:
