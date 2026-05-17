@@ -1,0 +1,187 @@
+name: case2 sweep (nonlinear pendulum)
+
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: 'Which case to run (a, b, or c)'
+        required: true
+        default: 'a'
+        type: choice
+        options:
+          - a
+          - b
+          - c
+      seed:
+        description: 'Random seed for this full sweep (0, 1, 2, ...)'
+        required: true
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: case2-sweep-${{ github.event.inputs.case }}-${{ github.event.inputs.seed }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: "case2=${{ github.event.inputs.case }} seed=${{ github.event.inputs.seed }} snr=${{ matrix.snr }} N=${{ matrix.n_models }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        snr: [5, 10, 15, 20, 25, 30, 35]
+        n_models: [1, 2]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run case2 sweep slice
+        env:
+          NTFY_TOPIC: ""
+        run: |
+          python case2_twn2n_v8_nonlinear.py \
+            --cases ${{ github.event.inputs.case }} \
+            --snr-only ${{ matrix.snr }} \
+            --n-modes-only ${{ matrix.n_models }} \
+            --seeds 1 \
+            --seed-start ${{ github.event.inputs.seed }} \
+            --restart
+
+      - name: Show slice summary
+        if: always()
+        run: |
+          if [ -f case2_v8_nonlinear_results/case2_v8_nonlinear_results.csv ]; then
+            echo "::group::CSV head"
+            head -n 1 case2_v8_nonlinear_results/case2_v8_nonlinear_results.csv
+            echo "::endgroup::"
+            echo "rows: $(wc -l < case2_v8_nonlinear_results/case2_v8_nonlinear_results.csv)"
+          else
+            echo "No CSV produced."
+          fi
+
+      - name: Upload slice CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-case2-${{ github.event.inputs.case }}-seed${{ github.event.inputs.seed }}-snr${{ matrix.snr }}-N${{ matrix.n_models }}
+          path: case2_v8_nonlinear_results/case2_v8_nonlinear_results.csv
+          if-no-files-found: warn
+
+  merge:
+    name: merge (case2=${{ github.event.inputs.case }} seed=${{ github.event.inputs.seed }})
+    needs: sweep
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas openpyxl requests
+
+      - name: Download slice artifacts (this run, this case+seed)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: csv-case2-${{ github.event.inputs.case }}-seed${{ github.event.inputs.seed }}-*
+          path: artifacts
+
+      - name: Merge CSVs
+        env:
+          CASE: ${{ github.event.inputs.case }}
+          SEED: ${{ github.event.inputs.seed }}
+        run: |
+          python <<'PY'
+          import glob, json, os
+          from pathlib import Path
+          import pandas as pd
+          case = os.environ['CASE']
+          seed = os.environ['SEED']
+          paths = sorted(glob.glob('artifacts/*/case2_v8_nonlinear_results.csv'))
+          print(f'found {len(paths)} slice CSV(s) for case2={case} seed={seed}:')
+          rows = []
+          for p in paths:
+              print(' ', p)
+              rows.append(pd.read_csv(p))
+          if not rows:
+              raise SystemExit(f'No slice CSVs to merge for case2={case} seed={seed}.')
+          merged = pd.concat(rows, ignore_index=True)
+          merged.drop_duplicates(
+              subset=['case', 'snr_db', 'n_modes', 'n_z', 'p_samples', 'seed'],
+              keep='last', inplace=True)
+          out = Path(f'case2_v8_nonlinear_case{case}_seed{seed}_merged.csv')
+          merged.to_csv(out, index=False)
+          print(f'wrote {out}, {len(merged)} unique rows, {len(merged.columns)} columns')
+          summary = {
+              'case': case,
+              'seed': seed,
+              'n_slices': len(paths),
+              'rows': int(len(merged)),
+              'columns': int(len(merged.columns)),
+              'unique_snrs': sorted(int(x) for x in merged['snr_db'].unique()),
+              'unique_Ns': sorted(int(x) for x in merged['n_modes'].unique()),
+              'median_G_NMSE_dB': float(merged['G_NMSE_dB'].median()),
+              'mean_G_NMSE_dB': float(merged['G_NMSE_dB'].mean()),
+          }
+          Path(f'merge_summary_case2_{case}_seed{seed}.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload merged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-case2-${{ github.event.inputs.case }}-seed${{ github.event.inputs.seed }}
+          path: |
+            case2_v8_nonlinear_case*_seed*_merged.csv
+            merge_summary_case2_*_seed*.json
+
+      - name: ntfy on completion
+        if: always()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'vinicius-claude-alert' }}
+          CASE: ${{ github.event.inputs.case }}
+          SEED: ${{ github.event.inputs.seed }}
+        run: |
+          python <<'PY'
+          import json, os, requests
+          case = os.environ['CASE']; seed = os.environ['SEED']
+          summary = {}
+          try:
+              summary = json.loads(open(f'merge_summary_case2_{case}_seed{seed}.json').read())
+          except Exception:
+              pass
+          topic = os.environ.get('NTFY_TOPIC') or 'vinicius-claude-alert'
+          status = 'DONE' if summary.get('rows') else 'FAILED'
+          msg = (f"GitHub Actions case2 v8 case({case}) seed={seed} sweep {status}: "
+                 f"{summary.get('rows', 0)} rows, "
+                 f"median G_NMSE_dB={summary.get('median_G_NMSE_dB', 'n/a')}")
+          try:
+              r = requests.post(f'https://ntfy.sh/{topic}',
+                                data=msg.encode('utf-8'),
+                                headers={'Title': f'TWN2N case2 v8 case({case}) seed={seed} - Actions DONE',
+                                         'Priority': 'high',
+                                         'Tags': 'white_check_mark' if status == 'DONE' else 'warning'},
+                                timeout=10)
+              print('ntfy:', r.status_code, msg)
+          except Exception as e:
+              print('ntfy failed:', e)
+          PY
