@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       case:
-        description: 'Which case to run (a or b)'
+        description: 'Which case to run (a, b, or c)'
         required: true
         default: 'a'
         type: choice
         options:
           - a
           - b
+          - c
       seed:
         description: 'Random seed for this full sweep (0, 1, 2, ...)'
         required: true
