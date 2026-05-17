@@ -15,6 +15,12 @@ What changed vs v7
               differ only in excitation (free vibration / single-shaker chirp)
               so the case-(b) results map the OMA-like regime in which the
               force is not measured by the denoiser.
+  * case (c): random unmeasured forces w driving every modal coordinate
+              with independent Gaussian white noise (broadband disturbance,
+              no measurable input). The channel pool of case (c) is
+              accelerations + velocities + positions per DOF in round-robin
+              order (max 3 N channels), so at n_z = 3 the focal network sees
+              one fully-instrumented DOF.
 
 Sweep size
 ----------
@@ -22,8 +28,8 @@ Sweep size
   n_z per N    = (2, 4, 8, 12, 12, 12)        total 50 values
   SNR          = (5, 10, 15, 20, 25, 30, 35)
   p_samples    = (1, 2, 3, 4, 5, 6)
-  cases        = (a, b)
-  cells/seed   = 2 * 7 * 50 * 6 = 4200
+  cases        = (a, b, c)
+  cells/seed   = 3 * 7 * 50 * 6 = 6300
 
 Outputs (parallel-safe with v6 and v7)
 --------------------------------------
@@ -89,7 +95,8 @@ ZETA_MIN = 0.0015
 ZETA_MAX = 0.05
 
 # *** v8: extended axes ***
-CASES = ("a", "b")
+CASES = ("a", "b", "c")
+_CASE_SEED_OFFSET = {"a": 0, "b": 1, "c": 2}
 SNR_DB = (5, 10, 15, 20, 25, 30, 35)
 N_MODES = (1, 2, 4, 6, 8, 16)
 P_SAMPLES = (1, 2, 3, 4, 5, 6)
@@ -209,6 +216,7 @@ def simulate_trajectory(system: dict[str, Any], case: str,
     Ad, B_u_d = discretise(A, B_u, dt)
     x = np.zeros((2 * N, n_steps))
 
+    w = np.zeros((N, n_steps))
     if case == "a":
         omegas = system["omegas"]
         q0 = (1.0 / omegas) * rng.choice([-1.0, 1.0], size=N)
@@ -224,6 +232,15 @@ def simulate_trajectory(system: dict[str, Any], case: str,
                          t1=float(t[-1]), method="linear").reshape(1, -1)
         for k in range(n_steps - 1):
             x[:, k + 1] = Ad @ x[:, k] + B_u_d[:, 0] * u[0, k]
+    elif case == "c":
+        # Random unmeasured forces w drive every modal coordinate with
+        # independent Gaussian white noise. Initial state zero, no measurable
+        # input. The denoiser sees only the noisy measurement record.
+        _, B_w_d = discretise(A, system["B_w"], dt)
+        w = rng.standard_normal((N, n_steps))
+        u = np.zeros((1, n_steps))
+        for k in range(n_steps - 1):
+            x[:, k + 1] = Ad @ x[:, k] + B_w_d @ w[:, k]
     else:
         raise ValueError(f"Unknown case '{case}'")
 
@@ -234,6 +251,8 @@ def simulate_trajectory(system: dict[str, Any], case: str,
     q_ddot = (-Omega @ Omega) @ q + (-2.0 * Z @ Omega) @ q_dot
     if case == "b":
         q_ddot += system["S_u"] @ u
+    elif case == "c":
+        q_ddot += w
     return {"q": q, "q_dot": q_dot, "q_ddot": q_ddot, "u": u}
 
 
@@ -241,12 +260,22 @@ def simulate_trajectory(system: dict[str, Any], case: str,
 # Channel ordering (no load cell in v8)
 # ============================================================================
 def channel_order_for_case(case: str, N: int) -> list[tuple[str, int]]:
-    """Nested-consistent ordered list. Index 0 is the anchor.
-    v8: no load cell channel — case (a) and case (b) share the same channel
-    pool of N accelerometers followed by N velocity sensors, so the
-    case-(b) results map the OMA-like regime where the force is unobserved
-    by the denoiser. Max n_z is 2 N for both cases.
+    """Nested-consistent ordered list. Index 0 is the focal channel.
+
+    * Case (a) and (b): N accelerometers then N velocity sensors
+      (max n_z = 2 N). No load cell channel; case (b) hides the force from
+      the denoiser, matching the OMA-like regime.
+    * Case (c): per DOF triplet [acc, vel, pos] in round-robin order, so
+      n_z = 1 sees acc_0, n_z = 2 adds vel_0, n_z = 3 completes DOF 0
+      with pos_0, n_z = 4 starts DOF 1 with acc_1, etc. Max n_z = 3 N.
     """
+    if case == "c":
+        order = []
+        for k in range(N):
+            order.append(("acc", k))
+            order.append(("vel", k))
+            order.append(("pos", k))
+        return order
     order = [("acc", 0)]
     for k in range(1, N):
         order.append(("acc", k))
@@ -266,6 +295,9 @@ def select_channels_from_traj(traj: dict[str, np.ndarray],
         elif ctype == "vel":
             rows.append(traj["q_dot"][dof])
             names.append(f"vel_dof{dof}")
+        elif ctype == "pos":
+            rows.append(traj["q"][dof])
+            names.append(f"pos_dof{dof}")
         else:
             raise ValueError(f"Unknown channel type {ctype!r}")
     return np.vstack(rows), names
@@ -436,7 +468,7 @@ def gain_db(noisy: np.ndarray, denoised: np.ndarray,
 def run_cell(case: str, snr_db: float, n_modes: int, n_z: int,
              p_samples: int, seed: int) -> dict[str, Any]:
     rng_sys = np.random.default_rng(
-        seed * 100003 + 7 * n_modes + (0 if case == "a" else 1))
+        seed * 100003 + 7 * n_modes + _CASE_SEED_OFFSET[case])
     system = sample_system(n_modes, rng_sys)
 
     full_order = channel_order_for_case(case, n_modes)
@@ -449,7 +481,7 @@ def run_cell(case: str, snr_db: float, n_modes: int, n_z: int,
     for exp_id in range(N_EXP_PER_CELL):
         rng_traj = np.random.default_rng(
             seed * 100003 + 7 * n_modes + 1000 + 11 * exp_id
-            + (0 if case == "a" else 1))
+            + _CASE_SEED_OFFSET[case])
         traj = simulate_trajectory(system, case, rng_traj)
         chs, names = select_channels_from_traj(traj, spec)
         chs_noisy, _ = add_noise_per_channel(chs, snr_db, rng_traj)
@@ -629,9 +661,9 @@ def main() -> int:
                              "Use --seeds 1 --seed-start N to pin a single seed.")
     parser.add_argument("--restart", action="store_true")
     parser.add_argument("--cases", default=",".join(CASES),
-                        help="Comma-separated subset of cases (a,b). "
-                             "Default: 'a,b'. Use e.g. --cases b to run only "
-                             "case (b) on this machine.")
+                        help="Comma-separated subset of cases (a, b, c). "
+                             "Default: 'a,b,c'. Use e.g. --cases c to run only "
+                             "case (c) on this machine.")
     parser.add_argument("--snr-only", default=",".join(str(s) for s in SNR_DB),
                         help="Comma-separated subset of SNR_DB values. "
                              "Default: all. Use e.g. --snr-only 5,10 to slice "
