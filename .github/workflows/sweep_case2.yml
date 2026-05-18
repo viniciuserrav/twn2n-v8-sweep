@@ -154,34 +154,4 @@ jobs:
             case2_v8_nonlinear_case*_seed*_merged.csv
             merge_summary_case2_*_seed*.json
 
-      - name: ntfy on completion
-        if: always()
-        env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'vinicius-claude-alert' }}
-          CASE: ${{ github.event.inputs.case }}
-          SEED: ${{ github.event.inputs.seed }}
-        run: |
-          python <<'PY'
-          import json, os, requests
-          case = os.environ['CASE']; seed = os.environ['SEED']
-          summary = {}
-          try:
-              summary = json.loads(open(f'merge_summary_case2_{case}_seed{seed}.json').read())
-          except Exception:
-              pass
-          topic = os.environ.get('NTFY_TOPIC') or 'vinicius-claude-alert'
-          status = 'DONE' if summary.get('rows') else 'FAILED'
-          msg = (f"GitHub Actions case2 v8 case({case}) seed={seed} sweep {status}: "
-                 f"{summary.get('rows', 0)} rows, "
-                 f"median G_NMSE_dB={summary.get('median_G_NMSE_dB', 'n/a')}")
-          try:
-              r = requests.post(f'https://ntfy.sh/{topic}',
-                                data=msg.encode('utf-8'),
-                                headers={'Title': f'TWN2N case2 v8 case({case}) seed={seed} - Actions DONE',
-                                         'Priority': 'high',
-                                         'Tags': 'white_check_mark' if status == 'DONE' else 'warning'},
-                                timeout=10)
-              print('ntfy:', r.status_code, msg)
-          except Exception as e:
-              print('ntfy failed:', e)
-          PY
+      # ntfy notifications disabled for this v2 sweep run
