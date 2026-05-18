@@ -117,8 +117,10 @@ def n_sensors_grid(N: int) -> list[int]:
     return list(np.unique(np.round(np.linspace(1, 2 * N, 12)).astype(int)))
 
 
-# Network / training (same as v7)
-LATENT_RHO = 1.0
+# Network / training (uniform-width architecture v2)
+HIDDEN_WIDTH = 96      # all hidden layers have this many units
+N_HIDDEN_LAYERS = 4    # number of hidden layers between input and output
+LATENT_RHO = 1.0       # retained for CSV backward compatibility only
 LEARNING_RATE = 1e-3
 LOSS = "mean_absolute_error"
 VAL_FRACTION = 0.10
@@ -357,22 +359,18 @@ class StopAfterOverfitting(Callback):
 
 def build_twn2n_model(num_in: int, num_out: int, latent_dim: int,
                       n_train_rows: int) -> Model:
-    FIRST_LAYER_ROWS_PER_PARAM = 2.0
-    h1_overfit_cap = max(8, int(n_train_rows / FIRST_LAYER_ROWS_PER_PARAM
-                                 / max(num_in + 1, 1)))
-    h1 = min(int(num_in * 2 + 6), 192, h1_overfit_cap)
-    h2 = min(int(num_in + 6), 128, max(8, h1))
-    bridge = min(max(int(h2 * 0.5), 2 * latent_dim + 6), 64)
+    """Uniform-width MLP: Input(num_in) -> N_HIDDEN_LAYERS x Dense(HIDDEN_WIDTH, tanh)
+    -> Dense(num_out, linear).  The latent_dim and n_train_rows parameters are
+    retained for call-site compatibility but ignored.
+    """
+    del latent_dim, n_train_rows  # signature-only, not used
+    H = HIDDEN_WIDTH
     inp = Input(shape=(num_in,))
-    x = Dense(h1, activation="tanh")(inp)
-    x = Dense(h2, activation="tanh")(x)
-    x = Dense(bridge, activation="tanh")(x)
-    z = Dense(latent_dim, activation="tanh", name=f"latent_r{latent_dim}")(x)
-    x = Dense(bridge, activation="tanh")(z)
-    x = Dense(h2, activation="tanh")(x)
-    x = Dense(h1, activation="tanh")(x)
+    x = inp
+    for _ in range(N_HIDDEN_LAYERS):
+        x = Dense(H, activation="tanh")(x)
     out = Dense(num_out, activation="linear")(x)
-    return Model(inp, out, name=f"TWN2N_v8_anchor_r{latent_dim}")
+    return Model(inp, out, name=f"TWN2N_v8_uniformH{H}_L{N_HIDDEN_LAYERS}")
 
 
 def build_lag_anchor(channels: np.ndarray, p: int
