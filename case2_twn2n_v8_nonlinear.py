@@ -1,23 +1,20 @@
-"""Case 2 — nonlinear pendulum sweep (v8 focal architecture).
+"""Class 2 — nonlinear pendulum sweep with LINEAR (angular) sensors (v8 focal).
 
-Two physical models:
-* ``n_modes = 1``: single pendulum (mass m, length L, tangential damping c).
-  Measurements: [x, y] = [L sin θ, L cos θ].  Max channel pool = 2.
-* ``n_modes = 2``: planar double pendulum (m1 = m2, L1 = L2, tangential
-  damping on each angle).  Measurements: [x1, y1, x2, y2].  Max pool = 4.
+Same physics as Class 3 (case3_twn2n_v8_nonlinear.py): single or double pendulum
+with sin(theta) gravity restoring torque and tangential viscous damping; three
+excitation regimes (a) free vibration, (b) one known shaker, (c) random
+unmeasured forces.  The only difference is the measurement model: instead of
+the Cartesian projection of the bobs (which is a nonlinear map of the state),
+the denoiser observes the angular state variables directly: theta and
+theta_dot for each pendulum.  The measurement map is therefore linear (it just
+selects rows of the state vector), making this the genuine Class~2 setting
+(nonlinear dynamics + linear measurement) of the framework in Section~3.
 
-Three excitation cases (matching Case 1):
-* (a) free vibration from a random initial angle;
-* (b) one known tangential shaker force applied to pendulum 1, log-linear
-      chirp in the range used by Case 1;
-* (c) random Gaussian "unmeasured" tangential forces on every pendulum.
-
-The focal-architecture TWN2N denoiser and the training/eval pipeline are
-imported from :mod:`case1_twn2n_v8_anchor` so the model definition is shared.
-
-The CSV schema is identical to Case 1's (same column set, including
-``n_modes``, which here means "number of pendulums in the chain"), so the
-multi-seed study notebook can be reused with only minor changes.
+Channel pool per model:
+  * n_models = 1 (single pendulum) : (theta, theta_dot)            -> max n_z = 2
+  * n_models = 2 (double pendulum) : (theta_1, theta_dot_1,
+                                        theta_2, theta_dot_2)      -> max n_z = 4
+Order is round-robin per pendulum so the focal channel is always theta_1.
 """
 
 from __future__ import annotations
@@ -42,6 +39,7 @@ os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
+# Re-use TWN2N training / SNR scaling / gain functions from Class~1
 from case1_twn2n_v8_anchor import (
     DT, N_S, R_OVERSAMPLE, NPERSEG,
     F_MIN_BRACKET, F_MAX_BRACKET, CHIRP_F0, CHIRP_F1,
@@ -50,186 +48,78 @@ from case1_twn2n_v8_anchor import (
     BATCH_SIZE,
     denoise_anchor_multi, gain_db, add_noise_per_channel, ntfy,
 )
+# Re-use pendulum integrator + force generator from Class~3 (same physics)
+from case3_twn2n_v8_nonlinear import (
+    simulate_trajectory as _c3_simulate_trajectory,
+    G as _G_DEFAULT, L_LINK as _L_DEFAULT, M_BOB as _M_DEFAULT,
+    C_TANG as _C_DEFAULT, THETA0_MAX as _T0_DEFAULT,
+    FORCE_AMP_B as _FB_DEFAULT, FORCE_AMP_C as _FC_DEFAULT,
+)
 
 # ============================================================================
 # Configuration
 # ============================================================================
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "vinicius-claude-alert")
 
-OUT_DIR = HERE / "case2_v8_nonlinear_results"
+OUT_DIR = HERE / "case2_v8_angular_results"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-CSV_PATH = OUT_DIR / "case2_v8_nonlinear_results.csv"
-XLSX_PATH = OUT_DIR / "case2_v8_nonlinear_results.xlsx"
-LOG_PATH = OUT_DIR / "case2_v8_nonlinear_run.log"
+CSV_PATH = OUT_DIR / "case2_v8_angular_results.csv"
+XLSX_PATH = OUT_DIR / "case2_v8_angular_results.xlsx"
+LOG_PATH = OUT_DIR / "case2_v8_angular_run.log"
 
-# Sweep grid — case2 axes
+# Sweep grid
 CASES = ("a", "b", "c")
-_CASE_SEED_OFFSET = {"a": 10, "b": 11, "c": 12}  # offset by +10 from case1
-N_MODELS = (1, 2)  # n_models = 1 -> single pendulum, n_models = 2 -> double
+# Seed offsets distinct from Class 1 and Class 3 so the random realisations
+# of the three classes are statistically independent for the same seed index.
+_CASE_SEED_OFFSET = {"a": 20, "b": 21, "c": 22}
+N_MODELS = (1, 2)
 
-# Pendulum parameters (fixed across the sweep)
-G = 9.81
-L_LINK = 1.0          # length of each rod
-M_BOB = 1.0           # mass of each bob
-# Tangential damping calibrated so the free-vibration record decays to a few
-# percent of its initial energy at T_REC (matching case 1's ZETA_MIN target):
-#   2*zeta*omega = C_TANG / (m L^2)   for the linearised pendulum,
-#   energy at T_REC = exp(-C_TANG * T_REC / (m L^2)).
-# With T_REC = 2000 s and m = L = 1, C_TANG = 1e-3 gives exp(-2) ≈ 13 % for
-# the single pendulum and ~1-5 % for the double pendulum's slowest mode, in
-# the same order of magnitude as case 1's slowest random-mode decay.
-C_TANG = 0.001
-THETA0_MAX = 0.6      # max initial angle, rad — large enough to exercise sin nonlinearity
-
-# Force amplitudes for cases (b) and (c).  Calibrated together with C_TANG
-# so the steady-state pendulum response stays at moderate angles
-# (|theta| <~ 0.5 rad), broadly matching the per-channel signal amplitudes
-# produced by the random linear systems of case 1.
-FORCE_AMP_B = 0.05
-FORCE_AMP_C = 0.05
+# Physical parameters: inherited from Class 3 verbatim so the two pendulum
+# studies share the same dynamics (only the sensor model differs).
+G = _G_DEFAULT
+L_LINK = _L_DEFAULT
+M_BOB = _M_DEFAULT
+C_TANG = _C_DEFAULT
+THETA0_MAX = _T0_DEFAULT
+FORCE_AMP_B = _FB_DEFAULT
+FORCE_AMP_C = _FC_DEFAULT
 
 
 def n_sensors_grid_case2(n_models: int) -> list[int]:
-    """Channel-count grid for case 2 (2 Cartesian sensors per pendulum)."""
+    """Channel-count grid: 2 angular sensors per pendulum (theta, theta_dot)."""
     return list(range(1, 2 * n_models + 1))
-
-
-# ============================================================================
-# Pendulum dynamics (RK4, with sub-stepping for the nonlinear regime)
-# ============================================================================
-RK4_SUBSTEPS = 4  # internal sub-steps per macro dt
-
-
-def _rk4_step(rhs, state, dt, *args):
-    k1 = rhs(state, *args)
-    k2 = rhs(state + 0.5 * dt * k1, *args)
-    k3 = rhs(state + 0.5 * dt * k2, *args)
-    k4 = rhs(state + dt * k3, *args)
-    return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-
-def _rhs_single(state, F_ext: float):
-    """state = [theta, theta_dot].  F_ext = tangential force on the bob."""
-    th, w = state
-    a = -G / L_LINK * np.sin(th) - C_TANG * w / (M_BOB * L_LINK ** 2) \
-        + F_ext / (M_BOB * L_LINK ** 2)
-    return np.array([w, a])
-
-
-def _rhs_double(state, F1: float, F2: float):
-    """state = [theta1, theta2, w1, w2]. F1, F2: tangential torques on each bob.
-
-    Lagrangian formulation: M(q) q̈ + C(q,q̇) q̇ + G(q) = τ ,
-    with τ_i = -c θ̇_i + F_i.  Direct 2×2 inversion of M.
-    """
-    t1, t2, w1, w2 = state
-    m1, m2, L1, L2, c = M_BOB, M_BOB, L_LINK, L_LINK, C_TANG
-    cdiff = np.cos(t1 - t2)
-    sdiff = np.sin(t1 - t2)
-    M11 = (m1 + m2) * L1 ** 2
-    M12 = m2 * L1 * L2 * cdiff
-    M22 = m2 * L2 ** 2
-    Cv1 = m2 * L1 * L2 * sdiff * w2 * w2
-    Cv2 = -m2 * L1 * L2 * sdiff * w1 * w1
-    Gv1 = (m1 + m2) * G * L1 * np.sin(t1)
-    Gv2 = m2 * G * L2 * np.sin(t2)
-    tau1 = -c * w1 + F1
-    tau2 = -c * w2 + F2
-    det = M11 * M22 - M12 * M12
-    rhs1 = tau1 - Cv1 - Gv1
-    rhs2 = tau2 - Cv2 - Gv2
-    a1 = (M22 * rhs1 - M12 * rhs2) / det
-    a2 = (M11 * rhs2 - M12 * rhs1) / det
-    return np.array([w1, w2, a1, a2])
-
-
-def _force_signal(case: str, n_steps: int, dt: float,
-                  rng: np.random.Generator, n_force_channels: int):
-    """Build the external-force time series for a given case.
-
-    Returns ``F[c, k]`` of shape ``(n_force_channels, n_steps)``.
-    """
-    F = np.zeros((n_force_channels, n_steps))
-    if case == "a":
-        return F
-    if case == "b":
-        # Random-phase chirp so that different seeds give different
-        # realisations even at the same n_models.
-        phi = rng.uniform(0.0, 2 * np.pi)
-        t = np.arange(n_steps) * dt
-        chirp = signal.chirp(t, f0=CHIRP_F0, f1=CHIRP_F1,
-                              t1=float(t[-1]), method="linear",
-                              phi=np.degrees(phi))
-        F[0] = FORCE_AMP_B * chirp
-        return F
-    if case == "c":
-        F[:] = FORCE_AMP_C * rng.standard_normal((n_force_channels, n_steps))
-        return F
-    raise ValueError(f"Unknown case '{case}'")
 
 
 def simulate_trajectory(n_models: int, case: str,
                         rng: np.random.Generator,
                         n_steps: int = N_S, dt: float = DT) -> dict[str, np.ndarray]:
-    """Integrate the pendulum chain and return Cartesian channels.
+    """Same dynamics as Class 3 (re-uses its integrator).
 
-    Output dict:
-        ``x`` : (n_models, n_steps)   horizontal position of each bob
-        ``y`` : (n_models, n_steps)   vertical   position of each bob
-        ``theta`` : (n_models, n_steps)   angle of each link
+    The Class-3 ``simulate_trajectory`` already returns ``theta`` of shape
+    ``(n_models, n_steps)`` together with the Cartesian ``x`` and ``y``; we
+    just ignore the Cartesian channels and compute ``theta_dot`` by central
+    differences on ``theta``.
     """
-    sub_dt = dt / RK4_SUBSTEPS
-    if n_models == 1:
-        state = np.array([rng.uniform(-THETA0_MAX, THETA0_MAX), 0.0])
-        F = _force_signal(case, n_steps, dt, rng, 1)
-        theta = np.zeros(n_steps)
-        omega = np.zeros(n_steps)
-        theta[0], omega[0] = state[0], state[1]
-        for k in range(n_steps - 1):
-            for _ in range(RK4_SUBSTEPS):
-                state = _rk4_step(_rhs_single, state, sub_dt, F[0, k])
-            theta[k + 1], omega[k + 1] = state[0], state[1]
-        x = (L_LINK * np.sin(theta))[None, :]
-        y = (L_LINK * np.cos(theta))[None, :]
-        return {"x": x, "y": y, "theta": theta[None, :]}
-    if n_models == 2:
-        state = np.array([rng.uniform(-THETA0_MAX, THETA0_MAX),
-                          rng.uniform(-THETA0_MAX, THETA0_MAX),
-                          0.0, 0.0])
-        # Case (b) drives only pendulum 1 (single shaker on bob 1).
-        # Case (c) drives both bobs independently.
-        n_force = 2
-        F = _force_signal(case, n_steps, dt, rng, n_force)
-        if case == "b":
-            F[1] = 0.0  # only one force
-        theta = np.zeros((2, n_steps))
-        theta[:, 0] = state[:2]
-        for k in range(n_steps - 1):
-            for _ in range(RK4_SUBSTEPS):
-                state = _rk4_step(_rhs_double, state, sub_dt,
-                                  F[0, k], F[1, k])
-            theta[:, k + 1] = state[:2]
-        x1 = L_LINK * np.sin(theta[0])
-        y1 = L_LINK * np.cos(theta[0])
-        x2 = x1 + L_LINK * np.sin(theta[1])
-        y2 = y1 + L_LINK * np.cos(theta[1])
-        x = np.stack([x1, x2], axis=0)
-        y = np.stack([y1, y2], axis=0)
-        return {"x": x, "y": y, "theta": theta}
-    raise ValueError(f"Unsupported n_models={n_models} for case 2")
+    traj = _c3_simulate_trajectory(n_models, case, rng, n_steps=n_steps, dt=dt)
+    theta = traj["theta"]
+    if theta.ndim == 1:
+        theta = theta[None, :]
+    theta_dot = np.zeros_like(theta)
+    # Centred finite difference, with one-sided differences at the boundaries.
+    theta_dot[:, 1:-1] = (theta[:, 2:] - theta[:, :-2]) / (2 * dt)
+    theta_dot[:, 0] = (theta[:, 1] - theta[:, 0]) / dt
+    theta_dot[:, -1] = (theta[:, -1] - theta[:, -2]) / dt
+    return {"theta": theta, "theta_dot": theta_dot}
 
 
-# ============================================================================
-# Channel ordering (round-robin x, y per pendulum)
-# ============================================================================
 def channel_order_for_case2(n_models: int) -> list[tuple[str, int]]:
-    """Returns ``[(x, 0), (y, 0), (x, 1), (y, 1), ...]`` truncated to
-    ``2 * n_models`` entries.  Index 0 is the focal channel (x of pendulum 0).
+    """Round-robin per pendulum: [(theta, 0), (theta_dot, 0), (theta, 1), ...]
+    so the focal channel (index 0) is theta_1.
     """
     order = []
     for k in range(n_models):
-        order.append(("x", k))
-        order.append(("y", k))
+        order.append(("theta", k))
+        order.append(("theta_dot", k))
     return order
 
 
@@ -238,25 +128,21 @@ def select_channels_from_traj_case2(traj: dict[str, np.ndarray],
                                     ) -> tuple[np.ndarray, list[str]]:
     rows, names = [], []
     for ctype, idx in channels_spec:
-        if ctype == "x":
-            rows.append(traj["x"][idx])
-            names.append(f"x_pend{idx}")
-        elif ctype == "y":
-            rows.append(traj["y"][idx])
-            names.append(f"y_pend{idx}")
+        if ctype == "theta":
+            rows.append(traj["theta"][idx])
+            names.append(f"theta_pend{idx}")
+        elif ctype == "theta_dot":
+            rows.append(traj["theta_dot"][idx])
+            names.append(f"thetadot_pend{idx}")
         else:
             raise ValueError(f"Unknown channel type {ctype!r}")
     return np.vstack(rows), names
 
 
-# ============================================================================
-# Single-cell runner
-# ============================================================================
 def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
              p_samples: int, seed: int) -> dict[str, Any]:
     rng_sys = np.random.default_rng(
         seed * 100003 + 7 * n_models + _CASE_SEED_OFFSET[case])
-
     full_order = channel_order_for_case2(n_models)
     if n_z > len(full_order):
         raise ValueError(
@@ -290,14 +176,8 @@ def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
     anchor_den_pool = np.concatenate(den_list)
     pooled = gain_db(anchor_noisy_pool, anchor_den_pool, anchor_clean_pool)
 
-    # Approximate "system" instantaneous frequency: small-angle linearisation
-    # gives omega_n = sqrt(g/L) for the single pendulum, and the two normal
-    # modes of the symmetric double pendulum are at sqrt(g/L) and sqrt(3 g/L).
-    # We report sqrt(g/L)/(2π) as f_max_sys for both, so the P_sys = p*dt*f_max_sys
-    # is comparable to case 1.
     f_max_sys = float(np.sqrt(G / L_LINK) / (2 * np.pi))
-    f_min_sys = f_max_sys  # single dominant freq for both models
-
+    f_min_sys = f_max_sys
     row: dict[str, Any] = {
         "case": case,
         "snr_db": snr_db,
@@ -323,9 +203,6 @@ def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
     return row
 
 
-# ============================================================================
-# Sweep / resume / persistence
-# ============================================================================
 def build_cells(smoke: bool = False,
                 cases_filter: tuple = CASES,
                 snr_filter: tuple = SNR_DB,
@@ -381,9 +258,6 @@ def save_excel(rows: list[dict[str, Any]],
         meta.to_excel(wr, sheet_name="run_config", index=False)
 
 
-# ============================================================================
-# Main
-# ============================================================================
 def _parse_csv_list(s, cast):
     return tuple(cast(x) for x in s.split(",") if x.strip())
 
@@ -413,16 +287,13 @@ def main() -> int:
         CSV_PATH.unlink()
         print(f"--restart: deleted existing {CSV_PATH.name}", flush=True)
     already_done = load_already_done(CSV_PATH)
-    if already_done:
-        print(f"Resume: found {len(already_done)} cells already in "
-              f"{CSV_PATH.name}; they will be skipped.", flush=True)
 
     run_config = {
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "host": socket.gethostname(),
         "python": sys.version.split()[0],
         "ntfy_topic": NTFY_TOPIC,
-        "variant": "case2-v8-nonlinear (pendulum + double pendulum)",
+        "variant": "class2-v8-nonlinear-angular (pendulum, theta+theta_dot sensors)",
         "smoke": bool(args.smoke),
         "restart": bool(args.restart),
         "n_seeds": n_seeds,
@@ -447,13 +318,7 @@ def main() -> int:
     }
     print(json.dumps(run_config, indent=2, default=str), flush=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
-        fh.write(f"== case2 v8 sweep started {run_config['started_at']} "
-                 f"(resume: {len(already_done)} cells) ==\n")
-
-    ntfy(message=(f"Starting case2 v8 sweep on {run_config['host']}: "
-                  f"{total} trainings, {len(already_done)} already done."),
-         title="TWN2N case2 — sweep started",
-         priority="low", tags="hourglass_flowing_sand")
+        fh.write(f"== class2 v8 angular sweep started {run_config['started_at']}\n")
 
     t_start = time.time()
     rows: list[dict[str, Any]] = []
@@ -473,10 +338,6 @@ def main() -> int:
                     fh.write(f"ERROR seed={seed} cell={ci}/{len(cells)} "
                              f"case={case} snr={snr} N={n_models} "
                              f"n_z={n_z} p={p}: {e}\n{tb}\n")
-                ntfy(f"case2 v8 cell FAILED: seed={seed} case={case} "
-                     f"snr={snr} N={n_models} n_z={n_z} p={p} — {e}",
-                     title="TWN2N case2 — cell failed",
-                     priority="default", tags="warning")
                 continue
             row["wall_s"] = time.time() - t0
             rows.append(row)
@@ -487,14 +348,11 @@ def main() -> int:
                   f"({row['wall_s']:.1f} s)", flush=True)
 
     elapsed = time.time() - t_start
-    msg = (f"case2 v8 sweep DONE in {elapsed/60:.1f} min. "
+    msg = (f"class2 v8 angular sweep DONE in {elapsed/60:.1f} min. "
            f"Wrote {len(rows)} new rows, skipped {n_skipped}.")
     print(msg, flush=True)
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(msg + "\n")
-    ntfy(message=msg, title="TWN2N case2 — sweep done",
-         priority="default", tags="white_check_mark")
-
     try:
         save_excel(rows, XLSX_PATH, run_config)
     except Exception as e:
