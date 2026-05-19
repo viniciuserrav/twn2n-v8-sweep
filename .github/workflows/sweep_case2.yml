@@ -1,4 +1,4 @@
-name: case2 sweep (nonlinear pendulum)
+name: case2 sweep (nonlinear pendulum, angular sensors)
 
 on:
   workflow_dispatch:
@@ -66,11 +66,11 @@ jobs:
       - name: Show slice summary
         if: always()
         run: |
-          if [ -f case2_v8_nonlinear_results/case2_v8_nonlinear_results.csv ]; then
+          if [ -f case2_v8_angular_results/case2_v8_angular_results.csv ]; then
             echo "::group::CSV head"
-            head -n 1 case2_v8_nonlinear_results/case2_v8_nonlinear_results.csv
+            head -n 1 case2_v8_angular_results/case2_v8_angular_results.csv
             echo "::endgroup::"
-            echo "rows: $(wc -l < case2_v8_nonlinear_results/case2_v8_nonlinear_results.csv)"
+            echo "rows: $(wc -l < case2_v8_angular_results/case2_v8_angular_results.csv)"
           else
             echo "No CSV produced."
           fi
@@ -80,7 +80,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: csv-case2-${{ github.event.inputs.case }}-seed${{ github.event.inputs.seed }}-snr${{ matrix.snr }}-N${{ matrix.n_models }}
-          path: case2_v8_nonlinear_results/case2_v8_nonlinear_results.csv
+          path: case2_v8_angular_results/case2_v8_angular_results.csv
           if-no-files-found: warn
 
   merge:
@@ -116,7 +116,7 @@ jobs:
           import pandas as pd
           case = os.environ['CASE']
           seed = os.environ['SEED']
-          paths = sorted(glob.glob('artifacts/*/case2_v8_nonlinear_results.csv'))
+          paths = sorted(glob.glob('artifacts/*/case2_v8_angular_results.csv'))
           print(f'found {len(paths)} slice CSV(s) for case2={case} seed={seed}:')
           rows = []
           for p in paths:
@@ -128,7 +128,7 @@ jobs:
           merged.drop_duplicates(
               subset=['case', 'snr_db', 'n_modes', 'n_z', 'p_samples', 'seed'],
               keep='last', inplace=True)
-          out = Path(f'case2_v8_nonlinear_case{case}_seed{seed}_merged.csv')
+          out = Path(f'case2_v8_angular_case{case}_seed{seed}_merged.csv')
           merged.to_csv(out, index=False)
           print(f'wrote {out}, {len(merged)} unique rows, {len(merged.columns)} columns')
           summary = {
@@ -151,7 +151,7 @@ jobs:
         with:
           name: merged-case2-${{ github.event.inputs.case }}-seed${{ github.event.inputs.seed }}
           path: |
-            case2_v8_nonlinear_case*_seed*_merged.csv
+            case2_v8_angular_case*_seed*_merged.csv
             merge_summary_case2_*_seed*.json
 
       # ntfy notifications disabled for this v2 sweep run
