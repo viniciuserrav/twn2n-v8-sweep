@@ -9,18 +9,24 @@ What changed vs v7
 ------------------
   * N axis  : (1, 2, 4, 6, 8, 16)         was (2, 4, 8, 16); N=1 and N=6 added.
   * SNR axis: (5, 10, 15, 20, 25, 30, 35) was (5, ..., 25); 30 and 35 dB added.
-  * n_z grid: 1 .. 2 N for N in {1, 2, 4, 6}   (full enumeration);
-              12 evenly spaced values from 1 to 2 N for N in {8, 16}.
-              No load cell channel in either case; case (a) and case (b)
-              differ only in excitation (free vibration / single-shaker chirp)
-              so the case-(b) results map the OMA-like regime in which the
-              force is not measured by the denoiser.
-  * case (c): random unmeasured forces w driving every modal coordinate
-              with independent Gaussian white noise (broadband disturbance,
-              no measurable input). The channel pool of case (c) is
-              accelerations + velocities + positions per DOF in round-robin
-              order (max 3 N channels), so at n_z = 3 the focal network sees
-              one fully-instrumented DOF.
+  * measurement: modal dynamics, PHYSICAL sensors. Each channel is a
+              physical-point response obtained by projecting the modal state
+              through the mode-shape matrix Psi:
+                acc_j = Psi[j, :] . q_ddot_modal,  pos_j = Psi[j, :] . q_modal.
+              No velocity sensors. Channel pool per case:
+                case (a): N accelerometers then N position sensors (2 N max),
+                          n_z = 1 .. 2 N, focal = acc at DOF 0.
+                case (b): single measurable shaker applied at physical DOF 0;
+                          channels are [focal acc, force, other accs, positions]
+                          and n_z counts the force (n_z = 2 .. 2 N + 1). The
+                          focal accelerometer is swept over DOF 0 (the drive
+                          point) and DOF 1 (away from it) -> focal_dof axis,
+                          so case (b) has twice as many cells.
+                case (c): random unmeasured forces w on every modal
+                          coordinate; same [accs, positions] channel pool and
+                          n_z = 1 .. 2 N as case (a), focal = acc at DOF 0.
+              For N in {8, 16} the n_z grid is reduced to 12 evenly spaced
+              values to keep the sweep size manageable.
 
 Sweep size
 ----------
@@ -106,21 +112,21 @@ P_GRID = tuple(p / R_OVERSAMPLE for p in P_SAMPLES)
 def n_sensors_grid(N: int, case: str = "a") -> list[int]:
     """n_z grid for a given modal count N and case.
 
-    For N in {1, 2, 4, 6}: full enumeration 1 .. 2 N.
-    For N in {8, 16}     : 12 evenly spaced values from 1 to 2 N (rounded,
-                           duplicates removed).
-    Case (a) and case (c) use the acc+vel (and pos, for c) pool only.
-    Case (b) additionally exposes the measurable shaker force as one extra
-    channel, so its n_z grid gets one extra value at the top (the cell that
-    includes the force channel).
+    Cases (a) and (c): channel pool is N accelerometers + N position sensors,
+    so n_z runs 1 .. 2 N.
+    Case (b): the pool additionally contains the measurable shaker force, and
+    n_z counts it (n_z = 2 means [focal sensor, force]); n_z runs 2 .. 2 N + 1.
+
+    For N in {8, 16} the grid is reduced to 12 evenly spaced values (rounded,
+    duplicates removed) to keep the sweep size manageable.
     """
-    if N <= 6:
-        base = list(range(1, 2 * N + 1))
-    else:
-        base = list(np.unique(np.round(np.linspace(1, 2 * N, 12)).astype(int)))
     if case == "b":
-        base = base + [base[-1] + 1]
-    return base
+        lo, hi = 2, 2 * N + 1
+    else:
+        lo, hi = 1, 2 * N
+    if N <= 6:
+        return list(range(lo, hi + 1))
+    return list(np.unique(np.round(np.linspace(lo, hi, 12)).astype(int)))
 
 
 # Network / training (uniform-width architecture v2)
@@ -185,7 +191,12 @@ def sample_system(N: int, rng: np.random.Generator) -> dict[str, Any]:
     ])
 
     Psi = random_orthonormal(N, rng)
-    S_u = Psi[:, :1]
+    # Point shaker applied at physical DOF 0: a unit force there has modal
+    # participation Psi^T e_0, i.e. the 0-th ROW of the mode-shape matrix Psi.
+    # Because Psi is orthonormal this gives unit instantaneous feedthrough into
+    # the physical acceleration of DOF 0 (the driving point) and zero into the
+    # other physical accelerations -- the physically correct mass-line picture.
+    S_u = Psi[0:1, :].T
     B_u = np.vstack([np.zeros((N, 1)), S_u])
     B_w = np.vstack([np.zeros((N, N)), np.eye(N)])
 
@@ -272,50 +283,49 @@ def simulate_trajectory(system: dict[str, Any], case: str,
 # ============================================================================
 # Channel ordering (no load cell in v8)
 # ============================================================================
-def channel_order_for_case(case: str, N: int) -> list[tuple[str, int]]:
-    """Nested-consistent ordered list. Index 0 is the focal channel.
+def channel_order_for_case(case: str, N: int,
+                           focal_dof: int = 0) -> list[tuple[str, int]]:
+    """Nested-consistent ordered channel list. Index 0 is the focal channel.
 
-    * Case (a) and (b): N accelerometers then N velocity sensors
-      (max n_z = 2 N). No load cell channel; case (b) hides the force from
-      the denoiser, matching the OMA-like regime.
-    * Case (c): per DOF triplet [acc, vel, pos] in round-robin order, so
-      n_z = 1 sees acc_0, n_z = 2 adds vel_0, n_z = 3 completes DOF 0
-      with pos_0, n_z = 4 starts DOF 1 with acc_1, etc. Max n_z = 3 N.
+    All accelerometer / position channels are PHYSICAL responses (see
+    ``select_channels_from_traj``).
+
+    * Case (a) and (c): N physical accelerometers (DOF 0 .. N-1) followed by
+      N physical position sensors (DOF 0 .. N-1). The focal channel is the
+      acceleration of DOF 0. Max n_z = 2 N.
+    * Case (b): the measurable shaker force sits at index 1, right after the
+      focal accelerometer. The focal accelerometer is the physical
+      acceleration of DOF ``focal_dof`` (0 = the drive point, 1 = away from
+      it). The remaining accelerometers (ascending DOF, focal skipped) and
+      then the N position sensors (ascending DOF) follow. Max n_z = 2 N + 1.
     """
-    if case == "c":
-        order = []
-        for k in range(N):
-            order.append(("acc", k))
-            order.append(("vel", k))
-            order.append(("pos", k))
-        return order
-    # Case (a) and (b): N accelerometers then N velocity sensors. The focal
-    # channel (index 0) is always acc_0. Case (b) appends the measurable
-    # shaker force as the LAST channel, so it is only included at the largest
-    # n_z value and never displaces the focal channel.
-    order = [("acc", 0)]
-    for k in range(1, N):
-        order.append(("acc", k))
-    for k in range(N):
-        order.append(("vel", k))
+    if case in ("a", "c"):
+        return [("acc", k) for k in range(N)] + [("pos", k) for k in range(N)]
     if case == "b":
-        order.append(("force", 0))
-    return order
+        order = [("acc", focal_dof), ("force", 0)]
+        order += [("acc", k) for k in range(N) if k != focal_dof]
+        order += [("pos", k) for k in range(N)]
+        return order
+    raise ValueError(f"Unknown case {case!r}")
 
 
 def select_channels_from_traj(traj: dict[str, np.ndarray],
-                              channels_spec: list[tuple[str, int]]
+                              channels_spec: list[tuple[str, int]],
+                              Psi: np.ndarray
                               ) -> tuple[np.ndarray, list[str]]:
+    """Build the measured channel matrix.
+
+    Accelerometers and position sensors are PHYSICAL: the physical response of
+    DOF j is the modal response projected through row j of the mode-shape
+    matrix Psi. The force channel is the scalar applied force itself.
+    """
     rows, names = [], []
     for ctype, dof in channels_spec:
         if ctype == "acc":
-            rows.append(traj["q_ddot"][dof])
+            rows.append(Psi[dof, :] @ traj["q_ddot"])
             names.append(f"acc_dof{dof}")
-        elif ctype == "vel":
-            rows.append(traj["q_dot"][dof])
-            names.append(f"vel_dof{dof}")
         elif ctype == "pos":
-            rows.append(traj["q"][dof])
+            rows.append(Psi[dof, :] @ traj["q"])
             names.append(f"pos_dof{dof}")
         elif ctype == "force":
             rows.append(traj["u"][0])
@@ -484,15 +494,16 @@ def gain_db(noisy: np.ndarray, denoised: np.ndarray,
 # Single cell runner
 # ============================================================================
 def run_cell(case: str, snr_db: float, n_modes: int, n_z: int,
-             p_samples: int, seed: int) -> dict[str, Any]:
+             p_samples: int, seed: int, focal_dof: int = 0) -> dict[str, Any]:
     rng_sys = np.random.default_rng(
         seed * 100003 + 7 * n_modes + _CASE_SEED_OFFSET[case])
     system = sample_system(n_modes, rng_sys)
 
-    full_order = channel_order_for_case(case, n_modes)
+    full_order = channel_order_for_case(case, n_modes, focal_dof)
     if n_z > len(full_order):
         raise ValueError(
-            f"n_z={n_z} > max channels {len(full_order)} for case={case}, N={n_modes}")
+            f"n_z={n_z} > max channels {len(full_order)} for case={case}, "
+            f"N={n_modes}, focal_dof={focal_dof}")
     spec = full_order[:n_z]
 
     clean_list, noisy_list, ch_names = [], [], []
@@ -501,7 +512,7 @@ def run_cell(case: str, snr_db: float, n_modes: int, n_z: int,
             seed * 100003 + 7 * n_modes + 1000 + 11 * exp_id
             + _CASE_SEED_OFFSET[case])
         traj = simulate_trajectory(system, case, rng_traj)
-        chs, names = select_channels_from_traj(traj, spec)
+        chs, names = select_channels_from_traj(traj, spec, system["Psi"])
         chs_noisy, _ = add_noise_per_channel(chs, snr_db, rng_traj)
         clean_list.append(chs)
         noisy_list.append(chs_noisy)
@@ -527,6 +538,7 @@ def run_cell(case: str, snr_db: float, n_modes: int, n_z: int,
         "n_modes": n_modes,
         "n_z": int(n_z),
         "p_samples": int(p_samples),
+        "focal_dof": int(focal_dof),
         "P_grid_nominal": p_samples / R_OVERSAMPLE,
         "P_sys": float(p_samples * DT * system["f_max_sys"]),
         "latent_dim": int(latent_dim),
@@ -552,34 +564,45 @@ def run_cell(case: str, snr_db: float, n_modes: int, n_z: int,
 def build_cells(smoke: bool = False,
                 cases_filter: tuple = CASES,
                 snr_filter: tuple = SNR_DB,
-                n_modes_filter: tuple = N_MODES) -> list[tuple]:
-    """Build the list of sweep cells.
+                n_modes_filter: tuple = N_MODES,
+                focal_dof_filter: tuple = (0, 1)) -> list[tuple]:
+    """Build the list of sweep cells, each a 6-tuple
+    ``(case, snr, N, n_z, p, focal_dof)``.
 
-    The three ``*_filter`` arguments let the caller slice the sweep along any
-    of the three discrete axes: this is how we distribute the same script
-    across multiple machines (cluster does case=a, GitHub Actions matrix does
-    case=b chunked by (SNR, N), etc.) without forking the codebase.
+    Cases (a) and (c) always use focal_dof = 0 (focal = acc at DOF 0). Case
+    (b) sweeps focal_dof over {0, 1} -- the focal accelerometer at the drive
+    point (DOF 0) and away from it (DOF 1) -- so it has twice as many cells.
+    focal_dof = 1 needs at least two DOFs, so it is skipped for N = 1.
+
+    The ``*_filter`` arguments slice the sweep along each discrete axis so the
+    same script can be distributed across multiple machines / matrix jobs.
     """
     if smoke:
         return [
-            ("a", 20, 1, 1, 3),
-            ("a", 20, 6, 6, 3),
-            ("b", 30, 8, 8, 3),
-            ("b", 35, 16, 16, 3),
+            ("a", 20, 2, 1, 3, 0),
+            ("a", 20, 6, 6, 3, 0),
+            ("b", 30, 2, 2, 3, 0),
+            ("b", 30, 2, 3, 3, 1),
+            ("c", 35, 4, 4, 3, 0),
         ]
     cells = []
     for case in CASES:
         if case not in cases_filter:
             continue
+        focal_dofs = (tuple(d for d in (0, 1) if d in focal_dof_filter)
+                      if case == "b" else (0,))
         for snr in SNR_DB:
             if snr not in snr_filter:
                 continue
             for N in N_MODES:
                 if N not in n_modes_filter:
                     continue
-                for n_z in n_sensors_grid(N, case):
-                    for p in P_SAMPLES:
-                        cells.append((case, snr, N, n_z, p))
+                for focal_dof in focal_dofs:
+                    if focal_dof == 1 and N < 2:
+                        continue
+                    for n_z in n_sensors_grid(N, case):
+                        for p in P_SAMPLES:
+                            cells.append((case, snr, N, n_z, p, focal_dof))
     return cells
 
 
@@ -588,6 +611,8 @@ def load_already_done(csv_path: Path) -> set[tuple]:
         return set()
     try:
         df = pd.read_csv(csv_path)
+        focal = (df["focal_dof"].astype(int) if "focal_dof" in df.columns
+                 else pd.Series(0, index=df.index, dtype=int))
         return set(zip(
             df["case"].astype(str),
             df["snr_db"].astype(float),
@@ -595,6 +620,7 @@ def load_already_done(csv_path: Path) -> set[tuple]:
             df["n_z"].astype(int),
             df["p_samples"].astype(int),
             df["seed"].astype(int),
+            focal,
         ))
     except Exception as exc:
         print(f"Warning: could not parse existing CSV ({exc}); starting fresh.",
@@ -610,20 +636,22 @@ def sweep_cells(cells: list[tuple], n_seeds: int,
     done = 0
     skipped = 0
     t_start = time.time()
-    for (case, snr, N, n_z, p) in cells:
+    for (case, snr, N, n_z, p, focal_dof) in cells:
         for seed in range(seed_start, seed_start + n_seeds):
-            key = (str(case), float(snr), int(N), int(n_z), int(p), int(seed))
+            key = (str(case), float(snr), int(N), int(n_z), int(p),
+                   int(seed), int(focal_dof))
             if key in already_done:
                 done += 1
                 skipped += 1
                 continue
             t0 = time.time()
             try:
-                row = run_cell(case, snr, N, n_z, p, seed)
+                row = run_cell(case, snr, N, n_z, p, seed, focal_dof)
             except Exception as exc:
                 row = {
                     "case": case, "snr_db": snr, "n_modes": N,
-                    "n_z": n_z, "p_samples": p, "seed": seed,
+                    "n_z": n_z, "p_samples": p, "focal_dof": focal_dof,
+                    "seed": seed,
                     "error": f"{type(exc).__name__}: {exc}",
                     "traceback": traceback.format_exc(),
                 }
@@ -635,7 +663,7 @@ def sweep_cells(cells: list[tuple], n_seeds: int,
             elapsed = time.time() - t_start
             eta = elapsed / max(done - skipped, 1) * (total - done)
             log_line = (f"[{done}/{total}] case={case} snr={snr} N={N} "
-                        f"n_z={n_z} p={p} seed={seed} -> "
+                        f"n_z={n_z} p={p} fdof={focal_dof} seed={seed} -> "
                         f"G={row.get('G_NMSE_dB', 'n/a')!s:>6.6} "
                         f"({row['wall_time_s']:.1f}s)  eta={eta/60:.1f}min  "
                         f"(skipped: {skipped})")
@@ -690,16 +718,29 @@ def main() -> int:
                         default=",".join(str(n) for n in N_MODES),
                         help="Comma-separated subset of N_MODES values. "
                              "Default: all.")
+    parser.add_argument("--focal-dof-only", default="0,1",
+                        help="Comma-separated subset of focal_dof values "
+                             "{0,1} for case (b). Default: '0,1'. Use e.g. "
+                             "--focal-dof-only 0 to run only the drive-point "
+                             "focal on this matrix job.")
     args = parser.parse_args()
 
     cases_filter = tuple(c.strip() for c in args.cases.split(",") if c.strip())
     snr_filter = _parse_csv_list(args.snr_only, int)
     n_modes_filter = _parse_csv_list(args.n_modes_only, int)
+    focal_dof_filter = _parse_csv_list(args.focal_dof_only, int)
 
     cells = build_cells(args.smoke, cases_filter=cases_filter,
-                        snr_filter=snr_filter, n_modes_filter=n_modes_filter)
+                        snr_filter=snr_filter, n_modes_filter=n_modes_filter,
+                        focal_dof_filter=focal_dof_filter)
     n_seeds = 1 if args.smoke else args.seeds
     total = len(cells) * n_seeds
+
+    if total == 0:
+        print("No cells match this filter combination; nothing to do "
+              "(e.g. case b with N=1 and focal_dof=1). Exiting cleanly.",
+              flush=True)
+        return 0
 
     if args.restart and CSV_PATH.exists():
         CSV_PATH.unlink()
@@ -715,7 +756,9 @@ def main() -> int:
         "python": sys.version.split()[0],
         "tensorflow": tf.__version__,
         "ntfy_topic": NTFY_TOPIC,
-        "variant": "v8-anchor (extended N and SNR axes, no load cell channel)",
+        "variant": ("v8-anchor (modal dynamics, physical sensors via Psi-row "
+                    "projection; no velocity sensors; case-b force at physical "
+                    "DOF 0 with focal_dof in {0,1})"),
         "smoke": bool(args.smoke),
         "restart": bool(args.restart),
         "n_seeds": n_seeds,
@@ -729,7 +772,9 @@ def main() -> int:
         "zeta_min": ZETA_MIN, "zeta_max": ZETA_MAX,
         "CASES": CASES, "SNR_DB": SNR_DB, "N_MODES": N_MODES,
         "P_SAMPLES": P_SAMPLES,
-        "n_sensors_per_N": {N: n_sensors_grid(N) for N in N_MODES},
+        "n_sensors_per_N": {
+            f"{case}_N{N}": n_sensors_grid(N, case)
+            for case in CASES for N in N_MODES},
         "EPOCHS": EPOCHS, "BATCH_SIZE": BATCH_SIZE,
         "LEARNING_RATE": LEARNING_RATE, "PATIENCE": PATIENCE,
         "LATENT_RHO": LATENT_RHO,

@@ -1,17 +1,8 @@
-name: case sweep
+name: case b sweep (physical sensors, focal DOF 0 and 1)
 
 on:
   workflow_dispatch:
     inputs:
-      case:
-        description: 'Which case to run (a, b, or c)'
-        required: true
-        default: 'a'
-        type: choice
-        options:
-          - a
-          - b
-          - c
       seed:
         description: 'Random seed for this full sweep (0, 1, 2, ...)'
         required: true
@@ -22,12 +13,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: case-sweep-${{ github.event.inputs.case }}-${{ github.event.inputs.seed }}
+  group: caseb-sweep-${{ github.event.inputs.seed }}
   cancel-in-progress: false
 
 jobs:
   sweep:
-    name: "case=${{ github.event.inputs.case }} seed=${{ github.event.inputs.seed }} snr=${{ matrix.snr }} N=${{ matrix.n_modes }}"
+    name: "case=b seed=${{ github.event.inputs.seed }} snr=${{ matrix.snr }} N=${{ matrix.n_modes }} fdof=${{ matrix.focal }}"
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -35,6 +26,11 @@ jobs:
       matrix:
         snr: [5, 10, 15, 20, 25, 30, 35]
         n_modes: [1, 2, 4, 6, 8, 16]
+        focal: [0, 1]
+        exclude:
+          # focal_dof = 1 needs at least two DOFs
+          - n_modes: 1
+            focal: 1
 
     steps:
       - name: Checkout
@@ -51,14 +47,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run sweep slice
+      - name: Run case b sweep slice
         env:
           NTFY_TOPIC: ""
         run: |
           python case1_twn2n_v8_anchor.py \
-            --cases ${{ github.event.inputs.case }} \
+            --cases b \
             --snr-only ${{ matrix.snr }} \
             --n-modes-only ${{ matrix.n_modes }} \
+            --focal-dof-only ${{ matrix.focal }} \
             --seeds 1 \
             --seed-start ${{ github.event.inputs.seed }} \
             --restart
@@ -79,12 +76,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: csv-case${{ github.event.inputs.case }}-seed${{ github.event.inputs.seed }}-snr${{ matrix.snr }}-N${{ matrix.n_modes }}
+          name: csv-caseb-seed${{ github.event.inputs.seed }}-snr${{ matrix.snr }}-N${{ matrix.n_modes }}-f${{ matrix.focal }}
           path: case1_v8_anchor_results/case1_v8_anchor_results.csv
           if-no-files-found: warn
 
   merge:
-    name: merge (case=${{ github.event.inputs.case }} seed=${{ github.event.inputs.seed }})
+    name: merge (case=b seed=${{ github.event.inputs.seed }})
     needs: sweep
     if: always()
     runs-on: ubuntu-latest
@@ -99,86 +96,85 @@ jobs:
       - name: Install dependencies
         run: pip install pandas openpyxl requests
 
-      - name: Download slice artifacts (this run, this case+seed)
+      - name: Download slice artifacts (this run, this seed)
         uses: actions/download-artifact@v4
         with:
-          pattern: csv-case${{ github.event.inputs.case }}-seed${{ github.event.inputs.seed }}-*
+          pattern: csv-caseb-seed${{ github.event.inputs.seed }}-*
           path: artifacts
 
       - name: Merge CSVs
         env:
-          CASE: ${{ github.event.inputs.case }}
           SEED: ${{ github.event.inputs.seed }}
         run: |
           python <<'PY'
           import glob, json, os
           from pathlib import Path
           import pandas as pd
-          case = os.environ['CASE']
           seed = os.environ['SEED']
           paths = sorted(glob.glob('artifacts/*/case1_v8_anchor_results.csv'))
-          print(f'found {len(paths)} slice CSV(s) for case={case} seed={seed}:')
+          print(f'found {len(paths)} slice CSV(s) for case=b seed={seed}:')
           rows = []
           for p in paths:
               print(' ', p)
               rows.append(pd.read_csv(p))
           if not rows:
-              raise SystemExit(f'No slice CSVs to merge for case={case} seed={seed}.')
+              raise SystemExit(f'No slice CSVs to merge for case=b seed={seed}.')
           merged = pd.concat(rows, ignore_index=True)
           subset = ['case', 'snr_db', 'n_modes', 'n_z', 'p_samples', 'seed']
           if 'focal_dof' in merged.columns:
               subset.append('focal_dof')
           merged.drop_duplicates(subset=subset, keep='last', inplace=True)
-          out = Path(f'case1_v8_anchor_case{case}_seed{seed}_merged.csv')
+          out = Path(f'case1_v8_anchor_caseb_seed{seed}_merged.csv')
           merged.to_csv(out, index=False)
           print(f'wrote {out}, {len(merged)} unique rows, {len(merged.columns)} columns')
           summary = {
-              'case': case,
+              'case': 'b',
               'seed': seed,
               'n_slices': len(paths),
               'rows': int(len(merged)),
               'columns': int(len(merged.columns)),
               'unique_snrs': sorted(int(x) for x in merged['snr_db'].unique()),
               'unique_Ns': sorted(int(x) for x in merged['n_modes'].unique()),
+              'focal_dofs': sorted(int(x) for x in merged['focal_dof'].unique()),
               'median_G_NMSE_dB': float(merged['G_NMSE_dB'].median()),
               'mean_G_NMSE_dB': float(merged['G_NMSE_dB'].mean()),
           }
-          Path(f'merge_summary_case{case}_seed{seed}.json').write_text(json.dumps(summary, indent=2))
+          Path(f'merge_summary_caseb_seed{seed}.json').write_text(json.dumps(summary, indent=2))
           print(json.dumps(summary, indent=2))
           PY
 
       - name: Upload merged artifact
         uses: actions/upload-artifact@v4
         with:
-          name: merged-case${{ github.event.inputs.case }}-seed${{ github.event.inputs.seed }}
+          name: merged-caseb-seed${{ github.event.inputs.seed }}
           path: |
-            case1_v8_anchor_case*_seed*_merged.csv
-            merge_summary_case*_seed*.json
+            case1_v8_anchor_caseb_seed*_merged.csv
+            merge_summary_caseb_seed*.json
 
       - name: ntfy on completion
         if: always()
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC || 'vinicius-claude-alert' }}
-          CASE: ${{ github.event.inputs.case }}
           SEED: ${{ github.event.inputs.seed }}
         run: |
           python <<'PY'
           import json, os, requests
-          case = os.environ['CASE']; seed = os.environ['SEED']
+          seed = os.environ['SEED']
           summary = {}
           try:
-              summary = json.loads(open(f'merge_summary_case{case}_seed{seed}.json').read())
+              summary = json.loads(open(f'merge_summary_caseb_seed{seed}.json').read())
           except Exception:
               pass
           topic = os.environ.get('NTFY_TOPIC') or 'vinicius-claude-alert'
           status = 'DONE' if summary.get('rows') else 'FAILED'
-          msg = (f"TWN2N Class 1 case({case}) seed={seed} sweep {status}: "
+          msg = (f"TWN2N Class 1 case(b) physical-sensors seed={seed} sweep {status}: "
                  f"{summary.get('rows', 0)} rows, "
+                 f"focal_dofs={summary.get('focal_dofs')}, "
                  f"median G_NMSE_dB={summary.get('median_G_NMSE_dB', 'n/a')}")
           try:
               r = requests.post(f'https://ntfy.sh/{topic}',
                                 data=msg.encode('utf-8'),
-                                headers={'Title': f'TWN2N Class 1 case({case}) seed={seed} - DONE',
+                                headers={'Title': f'TWN2N Class 1 case(b) seed={seed} - {status}',
                                          'Priority': 'high',
                                          'Tags': 'white_check_mark' if status == 'DONE' else 'warning'},
                                 timeout=10)
