@@ -103,18 +103,24 @@ P_SAMPLES = (1, 2, 3, 4, 5, 6)
 P_GRID = tuple(p / R_OVERSAMPLE for p in P_SAMPLES)
 
 
-def n_sensors_grid(N: int) -> list[int]:
-    """n_z grid for a given modal count N.
+def n_sensors_grid(N: int, case: str = "a") -> list[int]:
+    """n_z grid for a given modal count N and case.
 
     For N in {1, 2, 4, 6}: full enumeration 1 .. 2 N.
     For N in {8, 16}     : 12 evenly spaced values from 1 to 2 N (rounded,
-                           duplicates removed). No load cell is included in
-                           either case; case (a) and case (b) share the same
-                           channel pool of accelerometers and velocity sensors.
+                           duplicates removed).
+    Case (a) and case (c) use the acc+vel (and pos, for c) pool only.
+    Case (b) additionally exposes the measurable shaker force as one extra
+    channel, so its n_z grid gets one extra value at the top (the cell that
+    includes the force channel).
     """
     if N <= 6:
-        return list(range(1, 2 * N + 1))
-    return list(np.unique(np.round(np.linspace(1, 2 * N, 12)).astype(int)))
+        base = list(range(1, 2 * N + 1))
+    else:
+        base = list(np.unique(np.round(np.linspace(1, 2 * N, 12)).astype(int)))
+    if case == "b":
+        base = base + [base[-1] + 1]
+    return base
 
 
 # Network / training (uniform-width architecture v2)
@@ -230,8 +236,13 @@ def simulate_trajectory(system: dict[str, Any], case: str,
             x[:, k + 1] = Ad @ x[:, k]
     elif case == "b":
         t = np.arange(n_steps) * dt
+        # Random-phase swept-sine: each of the N_EXP_PER_CELL trajectories of
+        # a cell draws an independent phase, so the three realisations differ
+        # in the excitation itself, not only in the noise draw.
+        phi_deg = float(rng.uniform(0.0, 360.0))
         u = signal.chirp(t, f0=CHIRP_F0, f1=CHIRP_F1,
-                         t1=float(t[-1]), method="linear").reshape(1, -1)
+                         t1=float(t[-1]), method="linear",
+                         phi=phi_deg).reshape(1, -1)
         for k in range(n_steps - 1):
             x[:, k + 1] = Ad @ x[:, k] + B_u_d[:, 0] * u[0, k]
     elif case == "c":
@@ -278,11 +289,17 @@ def channel_order_for_case(case: str, N: int) -> list[tuple[str, int]]:
             order.append(("vel", k))
             order.append(("pos", k))
         return order
+    # Case (a) and (b): N accelerometers then N velocity sensors. The focal
+    # channel (index 0) is always acc_0. Case (b) appends the measurable
+    # shaker force as the LAST channel, so it is only included at the largest
+    # n_z value and never displaces the focal channel.
     order = [("acc", 0)]
     for k in range(1, N):
         order.append(("acc", k))
     for k in range(N):
         order.append(("vel", k))
+    if case == "b":
+        order.append(("force", 0))
     return order
 
 
@@ -300,6 +317,9 @@ def select_channels_from_traj(traj: dict[str, np.ndarray],
         elif ctype == "pos":
             rows.append(traj["q"][dof])
             names.append(f"pos_dof{dof}")
+        elif ctype == "force":
+            rows.append(traj["u"][0])
+            names.append("force")
         else:
             raise ValueError(f"Unknown channel type {ctype!r}")
     return np.vstack(rows), names
@@ -557,7 +577,7 @@ def build_cells(smoke: bool = False,
             for N in N_MODES:
                 if N not in n_modes_filter:
                     continue
-                for n_z in n_sensors_grid(N):
+                for n_z in n_sensors_grid(N, case):
                     for p in P_SAMPLES:
                         cells.append((case, snr, N, n_z, p))
     return cells
