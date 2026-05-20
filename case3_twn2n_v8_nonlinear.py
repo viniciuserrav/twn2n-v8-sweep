@@ -2,14 +2,19 @@
 
 Two physical models:
 * ``n_modes = 1``: single pendulum (mass m, length L, tangential damping c).
-  Measurements: [x, y] = [L sin θ, L cos θ].  Max channel pool = 2.
 * ``n_modes = 2``: planar double pendulum (m1 = m2, L1 = L2, tangential
-  damping on each angle).  Measurements: [x1, y1, x2, y2].  Max pool = 4.
+  damping on each angle).
 
-Three excitation cases (matching Case 1):
+Measurements are Cartesian bob positions (a nonlinear map of the state),
+block-ordered as all horizontal x channels then all vertical y channels.
+
+Three excitation regimes (matching Class 1):
 * (a) free vibration from a random initial angle;
-* (b) one known tangential shaker force applied to pendulum 1, log-linear
-      chirp in the range used by Case 1;
+* (b) one known tangential shaker on bob 0 (random-phase swept-sine). The
+      force is a measurable channel at index 1, and n_z counts it; the focal
+      Cartesian sensor is swept over bob 0 (driven) and bob 1 (undriven) --
+      the focal_dof axis, so regime (b) has twice as many cells for the
+      double pendulum;
 * (c) random Gaussian "unmeasured" tangential forces on every pendulum.
 
 The focal-architecture TWN2N denoiser and the training/eval pipeline are
@@ -89,8 +94,15 @@ FORCE_AMP_B = 0.05
 FORCE_AMP_C = 0.05
 
 
-def n_sensors_grid_case3(n_models: int) -> list[int]:
-    """Channel-count grid for case 2 (2 Cartesian sensors per pendulum)."""
+def n_sensors_grid_case3(n_models: int, case: str = "a") -> list[int]:
+    """Channel-count grid for Class 3 (2 Cartesian sensors per pendulum).
+
+    Cases (a)/(c): n_z = 1 .. 2 n_models.
+    Case (b): the measurable shaker force is an extra channel counted by n_z,
+    so n_z = 2 .. 2 n_models + 1.
+    """
+    if case == "b":
+        return list(range(2, 2 * n_models + 2))
     return list(range(1, 2 * n_models + 1))
 
 
@@ -191,7 +203,7 @@ def simulate_trajectory(n_models: int, case: str,
             theta[k + 1], omega[k + 1] = state[0], state[1]
         x = (L_LINK * np.sin(theta))[None, :]
         y = (L_LINK * np.cos(theta))[None, :]
-        return {"x": x, "y": y, "theta": theta[None, :]}
+        return {"x": x, "y": y, "theta": theta[None, :], "force": F[0]}
     if n_models == 2:
         state = np.array([rng.uniform(-THETA0_MAX, THETA0_MAX),
                           rng.uniform(-THETA0_MAX, THETA0_MAX),
@@ -215,22 +227,33 @@ def simulate_trajectory(n_models: int, case: str,
         y2 = y1 + L_LINK * np.cos(theta[1])
         x = np.stack([x1, x2], axis=0)
         y = np.stack([y1, y2], axis=0)
-        return {"x": x, "y": y, "theta": theta}
+        return {"x": x, "y": y, "theta": theta, "force": F[0]}
     raise ValueError(f"Unsupported n_models={n_models} for case 2")
 
 
 # ============================================================================
 # Channel ordering (round-robin x, y per pendulum)
 # ============================================================================
-def channel_order_for_case3(n_models: int) -> list[tuple[str, int]]:
-    """Returns ``[(x, 0), (y, 0), (x, 1), (y, 1), ...]`` truncated to
-    ``2 * n_models`` entries.  Index 0 is the focal channel (x of pendulum 0).
+def channel_order_for_case3(n_models: int, case: str = "a",
+                            focal_dof: int = 0) -> list[tuple[str, int]]:
+    """Nested-consistent ordered channel list; index 0 is the focal channel.
+
+    Cartesian sensors are block-ordered: all horizontal x channels, then all
+    vertical y channels.
+
+    * Cases (a)/(c): ``[(x,0)..(x,n-1), (y,0)..(y,n-1)]``, focal = x of bob 0.
+    * Case (b): the measurable shaker force sits at index 1, right after the
+      focal channel. The focal channel is the x of bob ``focal_dof`` (0 = the
+      driven bob, 1 = the other bob); the remaining x channels (ascending,
+      focal skipped) and then all y channels follow. Max n_z = 2 n_models + 1.
     """
-    order = []
-    for k in range(n_models):
-        order.append(("x", k))
-        order.append(("y", k))
-    return order
+    if case == "b":
+        order = [("x", focal_dof), ("force", 0)]
+        order += [("x", k) for k in range(n_models) if k != focal_dof]
+        order += [("y", k) for k in range(n_models)]
+        return order
+    return ([("x", k) for k in range(n_models)]
+            + [("y", k) for k in range(n_models)])
 
 
 def select_channels_from_traj_case3(traj: dict[str, np.ndarray],
@@ -244,6 +267,9 @@ def select_channels_from_traj_case3(traj: dict[str, np.ndarray],
         elif ctype == "y":
             rows.append(traj["y"][idx])
             names.append(f"y_pend{idx}")
+        elif ctype == "force":
+            rows.append(traj["force"])
+            names.append("force")
         else:
             raise ValueError(f"Unknown channel type {ctype!r}")
     return np.vstack(rows), names
@@ -253,15 +279,15 @@ def select_channels_from_traj_case3(traj: dict[str, np.ndarray],
 # Single-cell runner
 # ============================================================================
 def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
-             p_samples: int, seed: int) -> dict[str, Any]:
+             p_samples: int, seed: int, focal_dof: int = 0) -> dict[str, Any]:
     rng_sys = np.random.default_rng(
         seed * 100003 + 7 * n_models + _CASE_SEED_OFFSET[case])
 
-    full_order = channel_order_for_case3(n_models)
+    full_order = channel_order_for_case3(n_models, case, focal_dof)
     if n_z > len(full_order):
         raise ValueError(
             f"n_z={n_z} > max channels {len(full_order)} for case={case}, "
-            f"n_models={n_models}")
+            f"n_models={n_models}, focal_dof={focal_dof}")
     spec = full_order[:n_z]
 
     clean_list, noisy_list, ch_names = [], [], []
@@ -304,6 +330,7 @@ def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
         "n_modes": n_models,
         "n_z": int(n_z),
         "p_samples": int(p_samples),
+        "focal_dof": int(focal_dof),
         "P_grid_nominal": p_samples / R_OVERSAMPLE,
         "P_sys": float(p_samples * DT * f_max_sys),
         "latent_dim": int(latent_dim),
@@ -329,16 +356,33 @@ def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
 def build_cells(smoke: bool = False,
                 cases_filter: tuple = CASES,
                 snr_filter: tuple = SNR_DB,
-                n_models_filter: tuple = N_MODELS) -> list[tuple]:
+                n_models_filter: tuple = N_MODELS,
+                focal_dof_filter: tuple = (0, 1)) -> list[tuple]:
+    """Sweep cells, each a 6-tuple ``(case, snr, n_models, n_z, p, focal_dof)``.
+
+    Regime (b) sweeps focal_dof over {0, 1} (the driven and the undriven bob);
+    focal_dof = 1 needs the double pendulum, so it is skipped for n_models = 1.
+    Regimes (a)/(c) always use focal_dof = 0.
+    """
+    if smoke:
+        return [("a", 20, 1, 1, 3, 0),
+                ("a", 20, 2, 4, 3, 0),
+                ("b", 30, 2, 2, 3, 0),
+                ("b", 30, 2, 3, 3, 1),
+                ("c", 25, 2, 4, 3, 0)]
     cells = []
     for case in cases_filter:
+        focal_dofs = (tuple(d for d in (0, 1) if d in focal_dof_filter)
+                      if case == "b" else (0,))
         for n_models in n_models_filter:
             for snr in snr_filter:
-                for n_z in n_sensors_grid_case3(n_models):
-                    for p in P_SAMPLES:
-                        cells.append((case, snr, n_models, n_z, p))
-    if smoke:
-        cells = cells[:4]
+                for focal_dof in focal_dofs:
+                    if focal_dof == 1 and n_models < 2:
+                        continue
+                    for n_z in n_sensors_grid_case3(n_models, case):
+                        for p in P_SAMPLES:
+                            cells.append(
+                                (case, snr, n_models, n_z, p, focal_dof))
     return cells
 
 
@@ -349,6 +393,8 @@ def load_already_done(csv_path: Path) -> set[tuple]:
         df = pd.read_csv(csv_path)
     except Exception:
         return set()
+    if "focal_dof" not in df.columns:
+        df["focal_dof"] = 0
     out = set()
     for _, r in df.iterrows():
         out.add((str(r["case"]),
@@ -356,7 +402,8 @@ def load_already_done(csv_path: Path) -> set[tuple]:
                  int(r["n_modes"]),
                  int(r["n_z"]),
                  int(r["p_samples"]),
-                 int(r["seed"])))
+                 int(r["seed"]),
+                 int(r["focal_dof"])))
     return out
 
 
@@ -398,14 +445,19 @@ def main() -> int:
     parser.add_argument("--snr-only", default=",".join(str(s) for s in SNR_DB))
     parser.add_argument("--n-modes-only",
                         default=",".join(str(n) for n in N_MODELS))
+    parser.add_argument("--focal-dof-only", default="0,1",
+                        help="Comma-separated subset of focal_dof values "
+                             "{0,1} for regime (b). Default: '0,1'.")
     args = parser.parse_args()
 
     cases_filter = tuple(c.strip() for c in args.cases.split(",") if c.strip())
     snr_filter = _parse_csv_list(args.snr_only, int)
     n_models_filter = _parse_csv_list(args.n_modes_only, int)
+    focal_dof_filter = _parse_csv_list(args.focal_dof_only, int)
 
     cells = build_cells(args.smoke, cases_filter=cases_filter,
-                        snr_filter=snr_filter, n_models_filter=n_models_filter)
+                        snr_filter=snr_filter, n_models_filter=n_models_filter,
+                        focal_dof_filter=focal_dof_filter)
     n_seeds = 1 if args.smoke else args.seeds
     total = len(cells) * n_seeds
 
@@ -422,7 +474,8 @@ def main() -> int:
         "host": socket.gethostname(),
         "python": sys.version.split()[0],
         "ntfy_topic": NTFY_TOPIC,
-        "variant": "case3-v8-nonlinear (pendulum + double pendulum)",
+        "variant": ("case3-v8-nonlinear (Cartesian sensors; regime b force "
+                    "is a measurable channel with focal_dof in {0,1})"),
         "smoke": bool(args.smoke),
         "restart": bool(args.restart),
         "n_seeds": n_seeds,
@@ -435,7 +488,9 @@ def main() -> int:
         "R_oversample": R_OVERSAMPLE, "nperseg": NPERSEG,
         "CASES": CASES, "SNR_DB": SNR_DB, "N_MODELS": N_MODELS,
         "P_SAMPLES": P_SAMPLES,
-        "n_sensors_per_n_models": {n: n_sensors_grid_case3(n) for n in N_MODELS},
+        "n_sensors_per_n_models": {
+            f"{c}_n{n}": n_sensors_grid_case3(n, c)
+            for c in CASES for n in N_MODELS},
         "EPOCHS": EPOCHS, "BATCH_SIZE": BATCH_SIZE,
         "LEARNING_RATE": LEARNING_RATE, "PATIENCE": PATIENCE,
         "LATENT_RHO": LATENT_RHO,
@@ -459,22 +514,24 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     n_skipped = 0
     for seed in range(args.seed_start, args.seed_start + n_seeds):
-        for ci, (case, snr, n_models, n_z, p) in enumerate(cells, 1):
-            key = (case, float(snr), int(n_models), int(n_z), int(p), int(seed))
+        for ci, (case, snr, n_models, n_z, p, focal_dof) in enumerate(cells, 1):
+            key = (case, float(snr), int(n_models), int(n_z), int(p),
+                   int(seed), int(focal_dof))
             if key in already_done:
                 n_skipped += 1
                 continue
             t0 = time.time()
             try:
-                row = run_cell(case, snr, n_models, n_z, p, seed)
+                row = run_cell(case, snr, n_models, n_z, p, seed, focal_dof)
             except Exception as e:
                 tb = traceback.format_exc()
                 with LOG_PATH.open("a", encoding="utf-8") as fh:
                     fh.write(f"ERROR seed={seed} cell={ci}/{len(cells)} "
                              f"case={case} snr={snr} N={n_models} "
-                             f"n_z={n_z} p={p}: {e}\n{tb}\n")
+                             f"n_z={n_z} p={p} fdof={focal_dof}: {e}\n{tb}\n")
                 ntfy(f"case3 v8 cell FAILED: seed={seed} case={case} "
-                     f"snr={snr} N={n_models} n_z={n_z} p={p} — {e}",
+                     f"snr={snr} N={n_models} n_z={n_z} p={p} "
+                     f"fdof={focal_dof} — {e}",
                      title="TWN2N case3 — cell failed",
                      priority="default", tags="warning")
                 continue
@@ -482,7 +539,7 @@ def main() -> int:
             rows.append(row)
             append_row(row)
             print(f"[seed={seed} cell {ci}/{len(cells)}] case={case} "
-                  f"snr={snr} N={n_models} n_z={n_z} p={p}  "
+                  f"snr={snr} N={n_models} n_z={n_z} p={p} fdof={focal_dof}  "
                   f"G_NMSE={row['G_NMSE_dB']:+.2f} dB  "
                   f"({row['wall_s']:.1f} s)", flush=True)
 

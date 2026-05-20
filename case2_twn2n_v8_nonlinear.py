@@ -10,11 +10,16 @@ theta_dot for each pendulum.  The measurement map is therefore linear (it just
 selects rows of the state vector), making this the genuine Class~2 setting
 (nonlinear dynamics + linear measurement) of the framework in Section~3.
 
+Channels are block-ordered: all angles theta, then all angular rates
+theta_dot.  Focal channel = theta of bob 0.  In regime (b) the measurable
+shaker force is an extra channel at index 1 (n_z counts it), and the focal
+angular sensor is swept over bob 0 (driven) and bob 1 (undriven) -- the
+focal_dof axis, so regime (b) has twice as many cells for the double pendulum.
+
 Channel pool per model:
-  * n_models = 1 (single pendulum) : (theta, theta_dot)            -> max n_z = 2
-  * n_models = 2 (double pendulum) : (theta_1, theta_dot_1,
-                                        theta_2, theta_dot_2)      -> max n_z = 4
-Order is round-robin per pendulum so the focal channel is always theta_1.
+  * n_models = 1 : [theta_0, theta_dot_0]                       -> max n_z 2/3
+  * n_models = 2 : [theta_0, theta_1, theta_dot_0, theta_dot_1] -> max n_z 4/5
+(the second figure is the regime-(b) maximum, which includes the force.)
 """
 
 from __future__ import annotations
@@ -85,8 +90,15 @@ FORCE_AMP_B = _FB_DEFAULT
 FORCE_AMP_C = _FC_DEFAULT
 
 
-def n_sensors_grid_case2(n_models: int) -> list[int]:
-    """Channel-count grid: 2 angular sensors per pendulum (theta, theta_dot)."""
+def n_sensors_grid_case2(n_models: int, case: str = "a") -> list[int]:
+    """Channel-count grid: 2 angular sensors per pendulum (theta, theta_dot).
+
+    Cases (a)/(c): n_z = 1 .. 2 n_models.
+    Case (b): the measurable shaker force is an extra channel counted by n_z,
+    so n_z = 2 .. 2 n_models + 1.
+    """
+    if case == "b":
+        return list(range(2, 2 * n_models + 2))
     return list(range(1, 2 * n_models + 1))
 
 
@@ -109,18 +121,31 @@ def simulate_trajectory(n_models: int, case: str,
     theta_dot[:, 1:-1] = (theta[:, 2:] - theta[:, :-2]) / (2 * dt)
     theta_dot[:, 0] = (theta[:, 1] - theta[:, 0]) / dt
     theta_dot[:, -1] = (theta[:, -1] - theta[:, -2]) / dt
-    return {"theta": theta, "theta_dot": theta_dot}
+    return {"theta": theta, "theta_dot": theta_dot, "force": traj["force"]}
 
 
-def channel_order_for_case2(n_models: int) -> list[tuple[str, int]]:
-    """Round-robin per pendulum: [(theta, 0), (theta_dot, 0), (theta, 1), ...]
-    so the focal channel (index 0) is theta_1.
+def channel_order_for_case2(n_models: int, case: str = "a",
+                            focal_dof: int = 0) -> list[tuple[str, int]]:
+    """Nested-consistent ordered channel list; index 0 is the focal channel.
+
+    Angular sensors are block-ordered: all angles theta, then all angular
+    rates theta_dot.
+
+    * Cases (a)/(c): ``[(theta,0)..(theta,n-1), (theta_dot,0)..]``, focal =
+      theta of bob 0.
+    * Case (b): the measurable shaker force sits at index 1, right after the
+      focal channel. The focal channel is theta of bob ``focal_dof`` (0 = the
+      driven bob, 1 = the other bob); the remaining theta channels (ascending,
+      focal skipped) and then all theta_dot channels follow.
+      Max n_z = 2 n_models + 1.
     """
-    order = []
-    for k in range(n_models):
-        order.append(("theta", k))
-        order.append(("theta_dot", k))
-    return order
+    if case == "b":
+        order = [("theta", focal_dof), ("force", 0)]
+        order += [("theta", k) for k in range(n_models) if k != focal_dof]
+        order += [("theta_dot", k) for k in range(n_models)]
+        return order
+    return ([("theta", k) for k in range(n_models)]
+            + [("theta_dot", k) for k in range(n_models)])
 
 
 def select_channels_from_traj_case2(traj: dict[str, np.ndarray],
@@ -134,20 +159,23 @@ def select_channels_from_traj_case2(traj: dict[str, np.ndarray],
         elif ctype == "theta_dot":
             rows.append(traj["theta_dot"][idx])
             names.append(f"thetadot_pend{idx}")
+        elif ctype == "force":
+            rows.append(traj["force"])
+            names.append("force")
         else:
             raise ValueError(f"Unknown channel type {ctype!r}")
     return np.vstack(rows), names
 
 
 def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
-             p_samples: int, seed: int) -> dict[str, Any]:
+             p_samples: int, seed: int, focal_dof: int = 0) -> dict[str, Any]:
     rng_sys = np.random.default_rng(
         seed * 100003 + 7 * n_models + _CASE_SEED_OFFSET[case])
-    full_order = channel_order_for_case2(n_models)
+    full_order = channel_order_for_case2(n_models, case, focal_dof)
     if n_z > len(full_order):
         raise ValueError(
             f"n_z={n_z} > max channels {len(full_order)} for case={case}, "
-            f"n_models={n_models}")
+            f"n_models={n_models}, focal_dof={focal_dof}")
     spec = full_order[:n_z]
 
     clean_list, noisy_list, ch_names = [], [], []
@@ -184,6 +212,7 @@ def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
         "n_modes": n_models,
         "n_z": int(n_z),
         "p_samples": int(p_samples),
+        "focal_dof": int(focal_dof),
         "P_grid_nominal": p_samples / R_OVERSAMPLE,
         "P_sys": float(p_samples * DT * f_max_sys),
         "latent_dim": int(latent_dim),
@@ -206,16 +235,33 @@ def run_cell(case: str, snr_db: float, n_models: int, n_z: int,
 def build_cells(smoke: bool = False,
                 cases_filter: tuple = CASES,
                 snr_filter: tuple = SNR_DB,
-                n_models_filter: tuple = N_MODELS) -> list[tuple]:
+                n_models_filter: tuple = N_MODELS,
+                focal_dof_filter: tuple = (0, 1)) -> list[tuple]:
+    """Sweep cells, each a 6-tuple ``(case, snr, n_models, n_z, p, focal_dof)``.
+
+    Regime (b) sweeps focal_dof over {0, 1} (the driven and the undriven bob);
+    focal_dof = 1 needs the double pendulum, so it is skipped for n_models = 1.
+    Regimes (a)/(c) always use focal_dof = 0.
+    """
+    if smoke:
+        return [("a", 20, 1, 1, 3, 0),
+                ("a", 20, 2, 4, 3, 0),
+                ("b", 30, 2, 2, 3, 0),
+                ("b", 30, 2, 3, 3, 1),
+                ("c", 25, 2, 4, 3, 0)]
     cells = []
     for case in cases_filter:
+        focal_dofs = (tuple(d for d in (0, 1) if d in focal_dof_filter)
+                      if case == "b" else (0,))
         for n_models in n_models_filter:
             for snr in snr_filter:
-                for n_z in n_sensors_grid_case2(n_models):
-                    for p in P_SAMPLES:
-                        cells.append((case, snr, n_models, n_z, p))
-    if smoke:
-        cells = cells[:4]
+                for focal_dof in focal_dofs:
+                    if focal_dof == 1 and n_models < 2:
+                        continue
+                    for n_z in n_sensors_grid_case2(n_models, case):
+                        for p in P_SAMPLES:
+                            cells.append(
+                                (case, snr, n_models, n_z, p, focal_dof))
     return cells
 
 
@@ -226,6 +272,8 @@ def load_already_done(csv_path: Path) -> set[tuple]:
         df = pd.read_csv(csv_path)
     except Exception:
         return set()
+    if "focal_dof" not in df.columns:
+        df["focal_dof"] = 0
     out = set()
     for _, r in df.iterrows():
         out.add((str(r["case"]),
@@ -233,7 +281,8 @@ def load_already_done(csv_path: Path) -> set[tuple]:
                  int(r["n_modes"]),
                  int(r["n_z"]),
                  int(r["p_samples"]),
-                 int(r["seed"])))
+                 int(r["seed"]),
+                 int(r["focal_dof"])))
     return out
 
 
@@ -272,14 +321,19 @@ def main() -> int:
     parser.add_argument("--snr-only", default=",".join(str(s) for s in SNR_DB))
     parser.add_argument("--n-modes-only",
                         default=",".join(str(n) for n in N_MODELS))
+    parser.add_argument("--focal-dof-only", default="0,1",
+                        help="Comma-separated subset of focal_dof values "
+                             "{0,1} for regime (b). Default: '0,1'.")
     args = parser.parse_args()
 
     cases_filter = tuple(c.strip() for c in args.cases.split(",") if c.strip())
     snr_filter = _parse_csv_list(args.snr_only, int)
     n_models_filter = _parse_csv_list(args.n_modes_only, int)
+    focal_dof_filter = _parse_csv_list(args.focal_dof_only, int)
 
     cells = build_cells(args.smoke, cases_filter=cases_filter,
-                        snr_filter=snr_filter, n_models_filter=n_models_filter)
+                        snr_filter=snr_filter, n_models_filter=n_models_filter,
+                        focal_dof_filter=focal_dof_filter)
     n_seeds = 1 if args.smoke else args.seeds
     total = len(cells) * n_seeds
 
@@ -293,7 +347,8 @@ def main() -> int:
         "host": socket.gethostname(),
         "python": sys.version.split()[0],
         "ntfy_topic": NTFY_TOPIC,
-        "variant": "class2-v8-nonlinear-angular (pendulum, theta+theta_dot sensors)",
+        "variant": ("class2-v8-nonlinear-angular (theta + theta_dot sensors; "
+                    "regime b force is a measurable channel, focal_dof in {0,1})"),
         "smoke": bool(args.smoke),
         "restart": bool(args.restart),
         "n_seeds": n_seeds,
@@ -306,7 +361,9 @@ def main() -> int:
         "R_oversample": R_OVERSAMPLE, "nperseg": NPERSEG,
         "CASES": CASES, "SNR_DB": SNR_DB, "N_MODELS": N_MODELS,
         "P_SAMPLES": P_SAMPLES,
-        "n_sensors_per_n_models": {n: n_sensors_grid_case2(n) for n in N_MODELS},
+        "n_sensors_per_n_models": {
+            f"{c}_n{n}": n_sensors_grid_case2(n, c)
+            for c in CASES for n in N_MODELS},
         "EPOCHS": EPOCHS, "BATCH_SIZE": BATCH_SIZE,
         "LEARNING_RATE": LEARNING_RATE, "PATIENCE": PATIENCE,
         "LATENT_RHO": LATENT_RHO,
@@ -324,26 +381,27 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     n_skipped = 0
     for seed in range(args.seed_start, args.seed_start + n_seeds):
-        for ci, (case, snr, n_models, n_z, p) in enumerate(cells, 1):
-            key = (case, float(snr), int(n_models), int(n_z), int(p), int(seed))
+        for ci, (case, snr, n_models, n_z, p, focal_dof) in enumerate(cells, 1):
+            key = (case, float(snr), int(n_models), int(n_z), int(p),
+                   int(seed), int(focal_dof))
             if key in already_done:
                 n_skipped += 1
                 continue
             t0 = time.time()
             try:
-                row = run_cell(case, snr, n_models, n_z, p, seed)
+                row = run_cell(case, snr, n_models, n_z, p, seed, focal_dof)
             except Exception as e:
                 tb = traceback.format_exc()
                 with LOG_PATH.open("a", encoding="utf-8") as fh:
                     fh.write(f"ERROR seed={seed} cell={ci}/{len(cells)} "
                              f"case={case} snr={snr} N={n_models} "
-                             f"n_z={n_z} p={p}: {e}\n{tb}\n")
+                             f"n_z={n_z} p={p} fdof={focal_dof}: {e}\n{tb}\n")
                 continue
             row["wall_s"] = time.time() - t0
             rows.append(row)
             append_row(row)
             print(f"[seed={seed} cell {ci}/{len(cells)}] case={case} "
-                  f"snr={snr} N={n_models} n_z={n_z} p={p}  "
+                  f"snr={snr} N={n_models} n_z={n_z} p={p} fdof={focal_dof}  "
                   f"G_NMSE={row['G_NMSE_dB']:+.2f} dB  "
                   f"({row['wall_s']:.1f} s)", flush=True)
 

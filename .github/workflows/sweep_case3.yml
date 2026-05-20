@@ -125,9 +125,10 @@ jobs:
           if not rows:
               raise SystemExit(f'No slice CSVs to merge for case3={case} seed={seed}.')
           merged = pd.concat(rows, ignore_index=True)
-          merged.drop_duplicates(
-              subset=['case', 'snr_db', 'n_modes', 'n_z', 'p_samples', 'seed'],
-              keep='last', inplace=True)
+          subset = ['case', 'snr_db', 'n_modes', 'n_z', 'p_samples', 'seed']
+          if 'focal_dof' in merged.columns:
+              subset.append('focal_dof')
+          merged.drop_duplicates(subset=subset, keep='last', inplace=True)
           out = Path(f'case3_v8_nonlinear_case{case}_seed{seed}_merged.csv')
           merged.to_csv(out, index=False)
           print(f'wrote {out}, {len(merged)} unique rows, {len(merged.columns)} columns')
